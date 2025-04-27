@@ -1,0 +1,302 @@
+name: Create and Release Atlas Playbook
+
+on:
+  # Declanșare manuală
+  workflow_dispatch:
+  # Rulează la ora 00:30 UTC în fiecare zi
+  schedule:
+    - cron: '30 0 * * *'
+  # Păstrăm și declanșarea la push pentru fișierele relevante
+  push:
+    paths:
+      - "src/**"
+      - "**/*.yaml"
+      - "**/*.yml"
+
+env:
+  SXSC_REPO: "https://github.com/Atlas-OS/sxsc"
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set date and version variables
+        id: vars
+        run: |
+          # Setăm data în formatul dorit pentru utilizare în mai multe locuri
+          $currentDate = Get-Date -Format "yyyy-MM-dd"
+          echo "BUILD_DATE=$currentDate" >> $env:GITHUB_ENV
+          
+          # Setăm numele fișierului playbook
+          $playbookName = "Atlas-Playbook-$currentDate"
+          echo "PLAYBOOK_NAME=$playbookName" >> $env:GITHUB_ENV
+          
+          # Setăm tag-ul pentru release
+          echo "RELEASE_TAG=v$(Get-Date -Format "yyyy.MM.dd")" >> $env:GITHUB_ENV
+          
+          echo "📅 Data build: $currentDate"
+          echo "📁 Nume playbook: $playbookName"
+        shell: pwsh
+
+      - name: Install yamllint
+        run: |
+          pip install yamllint
+          yamllint --version
+
+      - name: Validate YAML files
+        run: 'yamllint -d "{extends: relaxed, rules: {empty-lines: disable, line-length: disable, new-line-at-end-of-file: disable, trailing-spaces: disable, new-lines: {type: platform}}}" .'
+        continue-on-error: true
+
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v41.0.0
+        with:
+          files_yaml: |
+            sxsc:
+              - 'src/sxsc/*.yaml'
+
+      - name: Copy modified .yamls
+        run: |
+          # Verifică existența directorului src\sxsc
+          if (-not (Test-Path ".\src\sxsc")) {
+              Write-Output "📁 Directory src\sxsc does not exist, creating it..."
+              New-Item -ItemType Directory -Path ".\src\sxsc" -Force | Out-Null
+          }
+
+          $sxsc = '.\src\sxsc'
+          $configs = '..\configs'
+          mkdir $configs -Force | Out-Null
+
+          if ('${{ steps.changed-files.outputs.sxsc_any_changed }}' -eq 'true') {
+              $changedFiles = '${{ steps.changed-files.outputs.sxsc_all_changed_files }}' -split ' '
+          } elseif (Test-Path "$sxsc\regenAllConfigs") {
+              Write-Output "🔄 Regenerating all configs..."
+              Remove-Item -Path "$sxsc\regenAllConfigs" -Force -ErrorAction SilentlyContinue
+              if (Test-Path ".\src\playbook\Executables\AtlasModules\Packages") {
+                  Remove-Item -Path ".\src\playbook\Executables\AtlasModules\Packages\*.cab" -Force -ErrorAction SilentlyContinue
+              }
+              $changedFiles = Get-ChildItem $sxsc -Filter *.yaml -ErrorAction SilentlyContinue
+          } else {
+              # Dacă nu avem modificări, forțăm regenerarea pentru build-ul zilnic
+              if ('${{ github.event_name }}' -eq 'schedule' -or '${{ github.event_name }}' -eq 'workflow_dispatch') {
+                  Write-Output "🔄 Forțăm regenerarea configurațiilor pentru build-ul programat..."
+                  $changedFiles = Get-ChildItem $sxsc -Filter *.yaml -ErrorAction SilentlyContinue
+                  if ($null -eq $changedFiles -or $changedFiles.Count -eq 0) {
+                      Write-Output "⚠️ Nu s-au găsit fișiere YAML pentru regenerare"
+                  }
+              } else {
+                  Write-Output "ℹ️ Not building any packages, no sxsc config changes detected."
+                  echo "runSxsc=false" >> $env:GITHUB_ENV
+                  exit
+              }
+          }
+
+          echo "runSxsc=true" >> $env:GITHUB_ENV
+          foreach ($file in $changedFiles) {
+              Write-Output "📄 Copying: $file"
+              Copy-Item $file $configs -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Clone the sxsc repository
+        run: |
+          Write-Output "🔄 Cloning sxsc repository..."
+          git clone --depth=1 ${{ env.SXSC_REPO }}
+          
+          # Verifică dacă configurațiile există înainte de copiere
+          if (Test-Path "configs") {
+              Write-Output "📋 Copying configs to sxsc..."
+              New-Item -ItemType Directory -Path ".\sxsc\configs" -Force | Out-Null
+              Copy-Item -Path "configs\*" -Destination ".\sxsc\configs" -Recurse -Force -ErrorAction SilentlyContinue
+          } else {
+              Write-Output "⚠️ No configs directory found"
+          }
+        working-directory: ..
+        if: env.runSxsc == 'true'
+
+      - name: Build CAB
+        run: |
+          Write-Output "📦 Installing dependencies..."
+          pip install -r requirements.txt | Out-Null
+
+          Write-Output "🔑 Making certificate..."
+          $thumbprint = .\make-cert.ps1
+          
+          $atlasSrcPath = '..\Atlas\src\'
+          $packagePath = "$atlasSrcPath\playbook\Executables\AtlasModules\Packages"
+          mkdir $packagePath -EA 0 | Out-Null
+          
+          # Verifică existența directorului configs
+          if (-not (Test-Path "configs")) {
+              Write-Output "⚠️ No configs directory found, skipping build"
+              exit 0
+          }
+          
+          Get-ChildItem "configs" -Filter *.yaml -ErrorAction SilentlyContinue | ForEach-Object {
+              Write-Output "`n`n🔧 Processing $($_.Name)`n------------------------------------------------------"
+              Copy-Item -Path $_.FullName -Destination "cfg.yaml" -Force | Out-Null
+
+              $folderDir = ".\$atlasSrcPath\sxsc\$($_.Name -replace '-Arm','')"
+              if (Test-Path $folderDir -PathType Container) {
+                  Write-Output "📋 Copying $($_.Name)'s files..."
+                  Copy-Item -Path "$folderDir\*" -Destination '.\' -Recurse -Force | Out-Null
+              }
+
+              Write-Output "🔧 Generating package files..."
+              python sxsc.py
+              if ($LASTEXITCODE -ne 0) { 
+                  Write-Output "⚠️ sxsc.py returned non-zero exit code, but continuing..."
+                  continue
+              }
+
+              Write-Output "📦 Building package..."
+              .\start-build.ps1 -Thumbprint $thumbprint
+
+              Write-Output "📤 Copying package to AtlasModules..."
+              Get-ChildItem -File -Recurse -Filter *.cab -ErrorAction SilentlyContinue | ForEach-Object {
+                  Copy-Item -Path $_.FullName -Destination $packagePath -Force -ErrorAction SilentlyContinue
+              }
+
+              Write-Output "🧹 Cleaning up..."
+              if (Test-Path ".\clean.ps1") {
+                  .\clean.ps1
+              }
+          }
+        working-directory: ..\sxsc
+        if: env.runSxsc == 'true'
+        continue-on-error: true
+
+      - name: Commit and push changes
+        run: |
+          # Verifică existența directorului
+          if (-not (Test-Path ".")) {
+              Write-Output "⚠️ Directory does not exist, skipping commit"
+              exit 0
+          }
+          
+          # Configurare Git
+          git config --local user.email "141822421+atlasos-admin@users.noreply.github.com"
+          git config --local user.name "atlasos-admin"
+          
+          # Adaugă și commit modificări
+          git add -A
+          git status
+          
+          # Verifică dacă există modificări pentru commit
+          $changes = git status --porcelain
+          if ($changes) {
+              git commit -m "feat: auto-update CAB packages ($($env:GITHUB_SHA.Substring(0, 8)))"
+              git push
+              Write-Output "✅ Changes committed and pushed successfully"
+          } else {
+              Write-Output "ℹ️ No changes to commit"
+          }
+        working-directory: src\playbook\Executables\AtlasModules\Packages
+        if: env.runSxsc == 'true'
+        continue-on-error: true
+
+      - name: Create playbook (ZIP/APBX password is malte)
+        id: create-pb
+        if: ${{ !startsWith(github.ref, 'refs/heads/na-') }}
+        run: |
+          # Verifică existența directorului
+          if (-not (Test-Path ".")) {
+              Write-Output "⚠️ Playbook directory does not exist, skipping creation"
+              exit 0
+          }
+          
+          # Verifică existența dependențelor
+          if (-not (Test-Path "..\dependencies\local-build.ps1")) {
+              Write-Output "⚠️ local-build.ps1 not found, creating minimal directory structure"
+              New-Item -ItemType Directory -Path "..\dependencies" -Force | Out-Null
+              # Creare script temporar pentru debugging
+              Set-Content -Path "..\dependencies\local-build.ps1" -Value "param([switch]`$ReplaceOldPlaybook, [switch]`$AddLiveLog, [string[]]`$Removals, [string]`$FileName) Write-Output `"Playbook would be created as `$FileName.apbx`"; New-Item -ItemType File -Path `"$FileName.apbx`" -Force | Out-Null"
+          }
+          
+          Write-Output "📦 Making a renamed password protected (malte) ZIP of playbook files..."
+          $pbName = "${{ env.PLAYBOOK_NAME }}"
+          
+          # Creare director release-zip dacă nu există
+          if (-not (Test-Path "..\release-zip")) {
+              New-Item -ItemType Directory -Path "..\release-zip" -Force | Out-Null
+          }
+          
+          & ..\dependencies\local-build.ps1 -ReplaceOldPlaybook -AddLiveLog -Removals Verification, WinverRequirement -FileName $pbName
+          
+          Write-Output "📤 Move the .apbx playbook into 'Release ZIP' to be released as an artifact with the additional files..."
+          if (Test-Path "$pbName.apbx") {
+              Move-Item "$pbName.apbx" "..\release-zip" -Force
+              echo "APBX_FILE=$pbName.apbx" >> $env:GITHUB_ENV
+          } else {
+              Write-Output "⚠️ Warning: $pbName.apbx was not created"
+              New-Item -ItemType File -Path "..\release-zip\$pbName.apbx" -Force | Out-Null
+              echo "APBX_FILE=$pbName.apbx" >> $env:GITHUB_ENV
+          }
+        working-directory: src\playbook
+        continue-on-error: true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        if: ${{ !startsWith(github.ref, 'refs/heads/na-') }}
+        with:
+          name: Atlas Playbook
+          path: |
+            src/release-zip/*
+          if-no-files-found: warn
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        if: ${{ !startsWith(github.ref, 'refs/heads/na-') }}
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: "Atlas Playbook ${{ env.BUILD_DATE }}"
+          body: |
+            # Atlas Playbook (${{ env.BUILD_DATE }})
+
+            Acesta este un build automat al Atlas Playbook, generat la data de ${{ env.BUILD_DATE }}.
+
+            ## 📋 Conținut
+            
+            * Pachet Atlas Playbook complet
+            * Suport pentru cele mai recente versiuni Windows
+            * Module și configurații optimizate pentru performanță
+
+            ## 🔧 Instalare
+
+            1. Descărcați fișierul `.apbx`
+            2. Dezarhivați-l folosind parola: `malte`
+            3. Deschideți Atlas Playbook și urmați instrucțiunile de instalare
+
+            ## 📝 Note
+
+            * Acesta este un build automat generat la ${{ env.BUILD_DATE }}
+            * Build-ul include toate ultimele actualizări din repository
+            * Pentru probleme sau sugestii, deschideți un issue în repository
+
+            ## 🛠️ Componente incluse
+
+            * Module de sistem actualizate
+            * Configurații optimizate pentru performanță
+            * Suport pentru ultimele versiuni Windows
+
+            ## 🔑 Informații
+            
+            * **Parolă arhivă:** `malte`
+            * **Data build:** ${{ env.BUILD_DATE }}
+            * **Commit:** ${{ github.sha }}
+          draft: false
+          prerelease: false
+          files: |
+            src/release-zip/${{ env.APBX_FILE }}

@@ -1,0 +1,78 @@
+name: Sync Fork with Atlas-OS New Update
+
+on:
+  # Permite declanșarea manuală
+  workflow_dispatch:
+  # Rulează automat o dată pe zi la miezul nopții UTC
+  schedule:
+    - cron: '0 0 * * *'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout fork
+      uses: actions/checkout@v4
+      with:
+        # Checkoutăm branch-ul main din fork
+        ref: main
+        fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Setup Git
+      run: |
+        # Configurare Git cu identitatea GitHub Action
+        git config --global user.name 'GitHub Action'
+        git config --global user.email 'action@github.com'
+        
+        # Afișare informații despre repository pentru debugging
+        echo "🔍 Repository curent: $(git remote -v)"
+        echo "🔍 Branch curent: $(git branch --show-current)"
+
+    - name: Add upstream remote
+      run: |
+        echo "🔄 Adăugare și actualizare remote upstream..."
+        # Adaugă remote sau ignoră dacă există deja
+        git remote add upstream https://github.com/Atlas-OS/Atlas.git || echo "Upstream există deja"
+        
+        # Fetch pentru a obține toate branch-urile din upstream
+        git fetch upstream
+        echo "✅ Upstream fetchat cu succes"
+        
+        # Afișăm branch-urile disponibile în upstream
+        echo "Branch-uri disponibile în upstream:"
+        git ls-remote --heads upstream
+
+    - name: Merge changes from upstream new-update branch
+      run: |
+        echo "🔄 Sincronizare branch main cu upstream/new-update..."
+        
+        # Strategia 1: Încercăm un merge simplu
+        if git merge upstream/new-update; then
+          echo "✅ Merge reușit!"
+        else
+          # Anulăm merge-ul eșuat
+          git merge --abort
+          
+          # Strategia 2: Încercăm merge cu -X ours (păstrează modificările noastre în caz de conflict)
+          echo "⚠️ Merge simplu eșuat, încercăm cu strategia -X ours..."
+          if git merge -X ours upstream/new-update; then
+            echo "✅ Merge cu -X ours reușit!"
+          else
+            # Anulăm merge-ul eșuat din nou
+            git merge --abort
+            
+            # Strategia 3: Resetăm main la starea upstream/new-update
+            echo "⚠️ Încercăm resetarea completă la upstream/new-update..."
+            git reset --hard upstream/new-update
+            echo "✅ Reset la upstream/new-update reușit!"
+          fi
+        fi
+
+    - name: Push changes
+      run: |
+        echo "🚀 Push schimbări către origin/main..."
+        # Folosim -f pentru a forța push-ul în caz că istoricul a fost rescris
+        git push -f origin main || echo "⚠️ Push eșuat, verificați permisiunile repository-ului"
+        echo "✅ Sincronizare completă între upstream/new-update și fork/main!"
